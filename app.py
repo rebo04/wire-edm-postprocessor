@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
 import math, os, sys, json
 
-__version__='1.2.0'
+__version__='1.3.0'
 
 try:
     import ezdxf
@@ -347,6 +347,31 @@ def overcut_pt(c,dm):
             rem-=al
     return c[0]['start']
 
+def truncate_chain(c,dist):
+    """Recorta la cadena a `dist` mm de recorrido — parte el segmento donde cae."""
+    out=[];rem=dist
+    for seg in c:
+        if seg['type']=='LINE':
+            sl=pdist(seg['start'],seg['end'])
+            if rem<=sl-1e-9:
+                f=rem/sl if sl>1e-12 else 0.
+                sx,sy=seg['start'];ex,ey=seg['end']
+                s=dict(seg);s['end']=(sx+f*(ex-sx),sy+f*(ey-sy))
+                out.append(s);return out
+            out.append(seg);rem-=sl
+        elif seg['type']=='ARC':
+            r=seg['r'];ccw=seg.get('ccw',True);sa,ea=seg['sa'],seg['ea']
+            da=(ea-sa)%360 if ccw else (sa-ea)%360
+            if da<1e-6: da=360.
+            al=math.radians(da)*r
+            if rem<=al-1e-9:
+                frac=rem/al if al>1e-12 else 0.
+                na=norm_d(sa+da*frac) if ccw else norm_d(sa-da*frac)
+                s=dict(seg);s['ea']=na;s['end']=ang(seg['cx'],seg['cy'],r,na)
+                out.append(s);return out
+            out.append(seg);rem-=al
+    return out
+
 def seg_to_g(seg):
     t=seg['type'];ex,ey=seg['end']
     if t=='LINE': return f"G01{xy(ex,ey)}"
@@ -457,12 +482,22 @@ def generate_iso(chained,p):
     while len(eparams)<cuts: eparams.append(eparams[-1])
     offsets=offsets[:cuts];eparams=eparams[:cuts]
 
+    # Puente (tab): recortar el contorno para NO soltar la pieza.
+    # Los repasos van en reversa por el mismo camino (ping-pong).
+    tab=p.get('tab',0.);tab_on=tab>0.001
+    cut_chain=chained
+    if tab_on:
+        total=_clen(chained)
+        if tab>=total-0.01: raise ValueError('Puente ≥ longitud del contorno.')
+        cut_chain=truncate_chain(chained,total-tab)
+        do_oc=False   # overcut no aplica con puente
+
     thick=p['thickness']
     ts=str(int(thick)) if thick==int(thick) else str(thick)
 
     # Tiempo estimado: pasada 1 a velocidad de corte, repasos ~3× más rápidos
     v_cut=p.get('cut_speed',0.)
-    plen=_clen(chained)+ll*2+p['overcut']
+    plen=_clen(cut_chain)+ll*2+(0. if tab_on else p['overcut'])
     est=sum(plen/(v_cut*(1. if i==0 else 3.)) for i in range(cuts)) if v_cut>1e-9 else 0.
 
     L=[]
@@ -475,23 +510,43 @@ def generate_iso(chained,p):
                  f"{ep['p_ratio']:03d}    {ep['voltage']:03d}    {ep['aux']:03d}    {ep['speed']:03d}")
     if cuts==1: L.append(f"H001={offsets[0]} ")
     else:       L.append("  ".join(f"H{i+1:03d}={o}" for i,o in enumerate(offsets)))
-    L+=["   ",f"; Number : 1",f"G92{xy(tx,ty)}","G90","H001","E001","M98 P0001","M00","   "]
-    for i in range(1,cuts):
-        L+=[f"H{i+1:03d}",f"E{i+1:03d}","M98 P0001","M00","   "]
-    L+=["   ",f"G01{xy(tx,ty)}","M02","   ",f"N0001"]
-    L+=[f"G01{xy(lx,ly)}",f"{comp}",f"G01{xy(sx,sy)}"]
-    for seg in chained: L.append(seg_to_g(seg))
-    if do_oc: L.append(f"G01{xy(*oc)}")
-    exit_cmd='G00' if p.get('force_exit') else 'G01'
-    L+=["G50","G40",f"{exit_cmd}{xy(ex_lx,ex_ly)}","M99"]
+    if tab_on:
+        stop_pt=cut_chain[-1]['end']
+        comp_rev='G42' if comp=='G41' else 'G41'
+        L+=["   ",f"; Number : 1",f"G92{xy(tx,ty)}","G90"]
+        for i in range(cuts):
+            sub='P0001' if i%2==0 else 'P0002'   # ida / regreso alternados
+            L+=[f"H{i+1:03d}",f"E{i+1:03d}",f"M98 {sub}","M00","   "]
+        L+=["M02","   "]
+        # N0001 — IDA: corta hasta el puente y se detiene (la pieza NO cae)
+        L+=[f"N0001",f"G01{xy(lx,ly)}",f"{comp}",f"G01{xy(sx,sy)}"]
+        for seg in cut_chain: L.append(seg_to_g(seg))
+        L+=["G50","G40","M99"]
+        if cuts>1:
+            # N0002 — REGRESO: comp invertida (el lado se voltea con la dirección)
+            L+=["   ",f"N0002",f"{comp_rev}"]
+            for seg in rev(cut_chain): L.append(seg_to_g(seg))
+            L+=["G50","G40",f"G01{xy(lx,ly)}","M99"]
+        ex_lx,ex_ly=stop_pt
+    else:
+        L+=["   ",f"; Number : 1",f"G92{xy(tx,ty)}","G90","H001","E001","M98 P0001","M00","   "]
+        for i in range(1,cuts):
+            L+=[f"H{i+1:03d}",f"E{i+1:03d}","M98 P0001","M00","   "]
+        L+=["   ",f"G01{xy(tx,ty)}","M02","   ",f"N0001"]
+        L+=[f"G01{xy(lx,ly)}",f"{comp}",f"G01{xy(sx,sy)}"]
+        for seg in chained: L.append(seg_to_g(seg))
+        if do_oc: L.append(f"G01{xy(*oc)}")
+        exit_cmd='G00' if p.get('force_exit') else 'G01'
+        L+=["G50","G40",f"{exit_cmd}{xy(ex_lx,ex_ly)}","M99"]
 
     d0=offsets[0]/1000.
     return '\r\n'.join(L),{
         'direction':direction,'comp':comp,
         'lx':lx,'ly':ly,'tx':tx,'ty':ty,'sx':sx,'sy':sy,
         'ex_lx':ex_lx,'ex_ly':ex_ly,
-        'kerf':[kerf_seg_pts(s,comp,d0) for s in chained],
-        'gouges':gouge_check(chained,comp,d0),
+        'kerf':[kerf_seg_pts(s,comp,d0) for s in cut_chain],
+        'gouges':gouge_check(cut_chain,comp,d0),
+        'tab_pt':cut_chain[-1]['end'] if tab_on else None,
         'offset_mm':d0,'est_min':est}
 
 # ═══════════════════════════════════════════════════
@@ -531,6 +586,9 @@ def generate_iso_multi(contours,p):
     if cuts==1: L.append(f"H001={offsets[0]} ")
     else:       L.append("  ".join(f"H{i+1:03d}={o}" for i,o in enumerate(offsets)))
 
+    # Puente sólo en el perfil EXTERIOR (el último): los barrenos interiores
+    # se cortan completos — su slug debe caer antes de los repasos.
+    tab=p.get('tab',0.);tab_on=tab>0.001
     subs=[]
     for ci,chained in enumerate(conts,1):
         direction=contour_dir(chained)
@@ -541,8 +599,28 @@ def generate_iso_multi(contours,p):
         tx,ty=lx,ly                    # agujero de enhebrado = punto de lead-in
         ex_lx,ex_ly=perp_pt(chained[-1],ll)
         oc=overcut_pt(chained,p['overcut'])
+        is_outer=(ci==len(conts))
 
         L+=["   ",f"; Number : {ci}",f"G92{xy(tx,ty)}","G90"]
+
+        if tab_on and is_outer and tab<_clen(chained)-0.01:
+            cut_chain=truncate_chain(chained,_clen(chained)-tab)
+            comp_rev='G42' if comp=='G41' else 'G41'
+            rev_n=len(conts)+1
+            for i in range(cuts):
+                sub_n=ci if i%2==0 else rev_n
+                L+=[f"H{i+1:03d}",f"E{i+1:03d}",f"M98 P{sub_n:04d}","M00","   "]
+            sub=[f"N{ci:04d}",f"G01{xy(lx,ly)}",comp,f"G01{xy(sx,sy)}"]
+            for seg in cut_chain: sub.append(seg_to_g(seg))
+            sub+=["G50","G40","M99"]
+            subs.append(sub)
+            if cuts>1:
+                sub2=[f"N{rev_n:04d}",comp_rev]
+                for seg in rev(cut_chain): sub2.append(seg_to_g(seg))
+                sub2+=["G50","G40",f"G01{xy(lx,ly)}","M99"]
+                subs.append(sub2)
+            continue
+
         for i in range(cuts):
             L+=[f"H{i+1:03d}",f"E{i+1:03d}",f"M98 P{ci:04d}","M00","   "]
 
@@ -777,7 +855,9 @@ class DXFCanvas(tk.Canvas):
             self._arrowhead(clx,cly,csx,csy,CC['leadin'])
             self._dot(lx,ly,CC['leadin'],'LEAD-IN','e')
             ex_lx,ex_ly=info.get('ex_lx',lx),info.get('ex_ly',ly)
-            if (ex_lx,ex_ly)!=(lx,ly):
+            if info.get('tab_pt'):
+                self._dot(*info['tab_pt'],'#b45309','PUENTE','w')
+            elif (ex_lx,ex_ly)!=(lx,ly):
                 self._dot(ex_lx,ex_ly,CC['exit'],'SALIDA','w')
 
         # Kerf: trayectoria REAL del hilo compensada por el offset H1
@@ -1364,6 +1444,7 @@ class App(tk.Tk):
         self.v_wire=tk.StringVar(value='0.18');self.v_flush=tk.StringVar(value='DIC206')
         self.v_leadin=tk.StringVar(value='3.0');self.v_overcut=tk.StringVar(value='0.0')
         self.v_cutspeed=tk.StringVar(value='2.0')   # mm/min primera pasada (estimación)
+        self.v_tab=tk.StringVar(value='0')          # puente mm (0 = corte completo)
         self.v_kerf=tk.BooleanVar(value=True)       # mostrar trayectoria compensada
         self.v_leadin_angle =tk.StringVar(value='')   # ángulo lead-in  (vacío = auto/perp)
         self.v_leadout_angle=tk.StringVar(value='')   # ángulo lead-out (vacío = auto/perp)
@@ -1527,6 +1608,10 @@ class App(tk.Tk):
         sec('📐  LEAD-IN / OUT')
         row('Lead-in mm', self.v_leadin,  w=7)
         row('Overcut mm', self.v_overcut, w=7)
+        row('Puente mm',  self.v_tab,     w=7)
+        tk.Label(f,text='>0: NO suelta la pieza — corta hasta el puente\ny los repasos regresan en REVERSA (ping-pong)',
+                 bg=SIDEBAR,fg='#b45309',font=('SF Pro Display',7),justify='left'
+                 ).pack(anchor='w',padx=14)
 
         # Lead-in por ángulo + distancia
         tk.Frame(f,bg=BORDER,height=1).pack(fill='x',padx=10,pady=(6,0))
@@ -1744,7 +1829,7 @@ class App(tk.Tk):
             'leadin_angle' :f(self.v_leadin_angle,  None) if self.v_leadin_angle.get().strip()  else None,
             'leadout_angle':f(self.v_leadout_angle, None) if self.v_leadout_angle.get().strip() else None,
             'leadin_length':f(self.v_leadin,3.),'overcut':f(self.v_overcut,0.),
-            'cut_speed':f(self.v_cutspeed,2.),
+            'cut_speed':f(self.v_cutspeed,2.),'tab':f(self.v_tab,0.),
             'material':self.v_mat.get() or 'SKD11','thickness':f(self.v_thick,10.),
             'wire':f(self.v_wire,.18),'flush':self.v_flush.get() or 'DIC206',
             'offsets':offsets,'eparams':eparams}
@@ -1762,8 +1847,9 @@ class App(tk.Tk):
                 self._st(f"⚠  {len(gouges)} radio(s) ≤ offset — RIESGO DE GOUGE/ALARMA: "
                          f"{gouges[0][2]}"+('  (+más)' if len(gouges)>1 else ''),True)
             else:
+                tabtxt=f"  |  🔗 Puente {p['tab']}mm (repasos en reversa)" if p['tab']>0.001 else ''
                 self._st(f"✓  Contorno {ac+1}/{nc}  |  {info['direction']}  |  {info['comp']}  |  "
-                         f"{p['cuts']} pasada(s)  |  ⏱ {tstr}  |  Entry({info['sx']:.1f},{info['sy']:.1f})mm")
+                         f"{p['cuts']} pasada(s)  |  ⏱ {tstr}{tabtxt}  |  Entry({info['sx']:.1f},{info['sy']:.1f})mm")
         except Exception as e:
             self._st(f'Error: {e}',True);import traceback;traceback.print_exc()
 
@@ -1965,18 +2051,30 @@ class App(tk.Tk):
         lx,ly = info['lx'],info['ly']
         sx,sy = info['sx'],info['sy']
         ex_lx,ex_ly = info['ex_lx'],info['ex_ly']
-        last_end = chain[-1]['end']
+
+        # Con puente: recortar el contorno y simular el regreso en reversa
+        tab=p.get('tab',0.)
+        sim_chain=chain
+        if tab>0.001:
+            total=_clen(chain)
+            if tab<total-0.01: sim_chain=truncate_chain(chain,total-tab)
+        last_end = sim_chain[-1]['end']
 
         pts=[]
         pts += lp(tx,ty,lx,ly)         # hilo → lead-in approach
         pts += lp(lx,ly,sx,sy)         # lead-in → entrada contorno
-        for seg in chain:
+        cpts=[]
+        for seg in sim_chain:
             if seg['type']=='LINE':
                 x0,y0=seg['start']; x1,y1=seg['end']
-                pts+=lp(x0,y0,x1,y1)
+                cpts+=lp(x0,y0,x1,y1)
             elif seg['type']=='ARC':
-                pts+=ap(seg['cx'],seg['cy'],seg['r'],seg['sa'],seg['ea'],seg['ccw'])
-        pts += lp(last_end[0],last_end[1],ex_lx,ex_ly)  # fin contorno → lead-out
+                cpts+=ap(seg['cx'],seg['cy'],seg['r'],seg['sa'],seg['ea'],seg['ccw'])
+        pts+=cpts
+        if tab>0.001:
+            if p['cuts']>1: pts+=cpts[::-1]   # repaso de REGRESO por el mismo camino
+        else:
+            pts += lp(last_end[0],last_end[1],ex_lx,ex_ly)  # fin contorno → lead-out
 
         # ── Controles inline en la barra de estado ──
         stop_flag=[False]
