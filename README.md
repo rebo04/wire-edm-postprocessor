@@ -6,6 +6,7 @@ Reads a DXF profile, lets you set thread hole, lead-in/lead-out, entry/exit poin
 
 ### Key features
 
+- **Material library (Seguro / Rápido)** — built-in starting E-params for **Carburo-Tungsteno, Aluminio, Acero dulce, Acero tratado, D2, A2, S7** with 0.18mm molybdenum wire, auto-scaled to the material thickness (longer Pul_On, more flushing off-time and +V for thick plates; linear speed drops inversely with thickness). Pick the material, the Perfil (**Seguro** = conservative, protects wire and finish; **Rápido** = faster roughing), enter the espesor and hit **⚙ Aplicar**. `SKD11` is accepted as an alias of `D2`. *These are starting values — always validate against your machine's manual.*
 - **Kerf preview + gouge check** — draws the *real* compensated wire path (G41/G42 × offset H1) as an amber dashed line, and flags in red any inside radius smaller than the offset — the exact geometry that makes the controller alarm or gouge the part.
 - **Material presets** — save proven E-params/offsets/passes per material + thickness (`💾 PRESETS` in the sidebar) and reload them in one click. Stored in `~/.wedm_presets.json`.
 - **Multi-contour program (⧉ TODO)** — generates ONE ISO that cuts every contour in the plate: interior openings first, outer profile last, with `M00` re-thread stops between contours.

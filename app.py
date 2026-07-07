@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
 import math, os, sys, json
 
-__version__='1.1.0'
+__version__='1.2.0'
 
 try:
     import ezdxf
@@ -1281,6 +1281,64 @@ E_SKIM=[
 ]
 H_DEF=[100,75,60,50]
 
+# ═══════════════════════════════════════════════════
+#  LIBRERÍA DE MATERIALES — hilo molibdeno ø0.18 mm
+#  Valores base a 10 mm de espesor; se escalan con el espesor real.
+#  'Seguro'  = conservador (protege hilo y acabado)
+#  'Rápido'  = desbaste veloz (tolera algún riesgo de corte de hilo)
+#  ⚠ Valores INICIALES de referencia — validar contra el manual de la máquina.
+# ═══════════════════════════════════════════════════
+def _mk_rows(pul_on,i_max,volt,speed,p_ratio=3,w_sp=4):
+    """4 pasadas con el decaimiento estándar (principal + 3 repasos)."""
+    def r(po,im,v,sp,pr,ws):
+        return {'w_sp':ws,'i_max':im,'pul_on':po,'p_ratio':pr,'voltage':v,'aux':0,'speed':sp}
+    po=lambda k: max(4,int(round(pul_on*k)))
+    sp=lambda k: max(1,int(round(speed*k)))
+    return [r(po(1.0),i_max,          volt,   sp(1.0),p_ratio,          w_sp),
+            r(po(.75),max(1,i_max-1), volt-10,sp(.66),p_ratio,          w_sp),
+            r(po(.58),1,              volt-20,sp(.44),p_ratio,          max(2,w_sp-1)),
+            r(po(.42),1,              volt-30,sp(.33),max(2,p_ratio-1), max(2,w_sp-2))]
+
+MATERIALS={
+ 'ACERO DULCE':      {'Seguro':{'E':_mk_rows(22,1,100, 9),'v10':3.0},
+                      'Rápido':{'E':_mk_rows(28,2,100,12),'v10':5.0}},
+ 'ACERO TRATADO':    {'Seguro':{'E':_mk_rows(20,1,100, 8),'v10':2.5},
+                      'Rápido':{'E':_mk_rows(26,2,100,11),'v10':4.0}},
+ 'D2':               {'Seguro':{'E':_mk_rows(20,1,100, 8),'v10':2.2},
+                      'Rápido':{'E':_mk_rows(26,2,100,11),'v10':3.5}},
+ 'A2':               {'Seguro':{'E':_mk_rows(20,1,100, 8),'v10':2.4},
+                      'Rápido':{'E':_mk_rows(26,2,100,11),'v10':3.8}},
+ 'S7':               {'Seguro':{'E':_mk_rows(18,1,100, 7),'v10':2.2},
+                      'Rápido':{'E':_mk_rows(24,2,100,10),'v10':3.5}},
+ 'ALUMINIO':         {'Seguro':{'E':_mk_rows(16,1, 80,12,w_sp=3),'v10':6.0},
+                      'Rápido':{'E':_mk_rows(20,2, 80,14,w_sp=3),'v10':10.0}},
+ 'CARBURO-TUNGSTENO':{'Seguro':{'E':_mk_rows( 8,1, 90, 3,p_ratio=4),'v10':0.8},
+                      'Rápido':{'E':_mk_rows(12,1, 90, 5,p_ratio=4),'v10':1.3}},
+}
+MATERIAL_ALIAS={'SKD11':'D2','SKD-11':'D2','MILD STEEL':'ACERO DULCE',
+                'CARBURO':'CARBURO-TUNGSTENO','TUNGSTENO':'CARBURO-TUNGSTENO'}
+
+def material_eparams(mat,thick,profile):
+    """E-params y velocidad de corte (mm/min) adaptados al espesor.
+    Física: más espesor → más energía por chispa (Pul_On), más tiempo de
+    lavado (P_Ratio), más tensión de encendido; la velocidad LINEAL cae
+    inversa al espesor (tasa de área ≈ constante)."""
+    key=MATERIAL_ALIAS.get(mat.upper(),mat.upper())
+    if key not in MATERIALS: return None,None
+    base=MATERIALS[key][profile]
+    f=max(.5,min(2.5,thick/10.))
+    rows=[]
+    for r in base['E']:
+        rr=dict(r)
+        rr['pul_on']=min(99,max(4,int(round(r['pul_on']*(1+.35*(f-1))))))
+        if thick>=30: rr['p_ratio']=min(9,r['p_ratio']+1)
+        if thick>=50: rr['voltage']=min(150,r['voltage']+10)
+        if thick>=40:   rr['speed']=max(1,r['speed']-2)
+        elif thick>=25: rr['speed']=max(1,r['speed']-1)
+        rows.append(rr)
+    v=base['v10']*10./max(thick,1.)
+    return rows,round(max(v,.1),2)
+
 # ── Presets de material (persisten en el home del usuario) ──
 PRESET_FILE=os.path.expanduser('~/.wedm_presets.json')
 def load_presets():
@@ -1301,7 +1359,8 @@ class App(tk.Tk):
         self.v_dxf=tk.StringVar();self.v_layer=tk.StringVar()
         self.v_mode=tk.StringVar(value='Core');self.v_cutin=tk.StringVar(value='perp')
         self.v_comp=tk.StringVar(value='auto');self.v_cuts=tk.IntVar(value=1)
-        self.v_mat=tk.StringVar(value='SKD11');self.v_thick=tk.StringVar(value='10')
+        self.v_mat=tk.StringVar(value='D2');self.v_thick=tk.StringVar(value='10')
+        self.v_profile=tk.StringVar(value='Seguro')   # Seguro | Rápido
         self.v_wire=tk.StringVar(value='0.18');self.v_flush=tk.StringVar(value='DIC206')
         self.v_leadin=tk.StringVar(value='3.0');self.v_overcut=tk.StringVar(value='0.0')
         self.v_cutspeed=tk.StringVar(value='2.0')   # mm/min primera pasada (estimación)
@@ -1430,10 +1489,21 @@ class App(tk.Tk):
                        ).pack(anchor='w')
 
         sec('🔩  MATERIAL')
-        row('Material',  self.v_mat)
-        row('Espesor mm',self.v_thick,w=7)
+        cb_mat=row('Material',self.v_mat,choices=list(MATERIALS.keys()),w=16)
+        cb_mat.bind('<<ComboboxSelected>>',lambda e:self._apply_material())
+        e_thick=row('Espesor mm',self.v_thick,w=7)
+        e_thick.bind('<Return>',  lambda e:self._apply_material())
+        e_thick.bind('<FocusOut>',lambda e:self._apply_material())
         row('Hilo Ø mm', self.v_wire, w=7)
         row('Flush',     self.v_flush)
+        cb_prof=row('Perfil',self.v_profile,choices=['Seguro','Rápido'],w=9)
+        cb_prof.bind('<<ComboboxSelected>>',lambda e:self._apply_material())
+        tk.Button(f,text='⚙ Aplicar E-params (material + espesor)',
+                  command=self._apply_material,bg=GREEN,fg='white',relief='flat',
+                  font=('SF Pro Display',9,'bold'),padx=6,pady=4,cursor='hand2'
+                  ).pack(fill='x',padx=10,pady=(4,1))
+        tk.Label(f,text='Hilo molibdeno ø0.18 — valores iniciales, valida en máquina',
+                 bg=SIDEBAR,fg=TEXT2,font=('SF Pro Display',7)).pack(anchor='w',padx=14)
         row('Vel mm/min',self.v_cutspeed,w=7)
         tk.Label(f,text='Vel. de corte 1ª pasada — para estimar tiempo',
                  bg=SIDEBAR,fg=TEXT2,font=('SF Pro Display',7)).pack(anchor='w',padx=14)
@@ -1720,6 +1790,23 @@ class App(tk.Tk):
         except Exception as e:
             self._st(f'Error: {e}',True);import traceback;traceback.print_exc()
 
+    # ── Librería de materiales ───────────────────────
+    def _apply_material(self):
+        """Carga E-params y velocidad según material + espesor + perfil."""
+        try: thick=float(self.v_thick.get())
+        except: return
+        prof=self.v_profile.get() if self.v_profile.get() in ('Seguro','Rápido') else 'Seguro'
+        rows,v=material_eparams(self.v_mat.get(),thick,prof)
+        if rows is None: return   # material personalizado — no tocar nada
+        for fila,r in zip(self.e_vars,rows):
+            for var,k in zip(fila,self.e_keys): var.set(str(r[k]))
+        self.v_cutspeed.set(str(v))
+        self._gen()
+        r0=rows[0]
+        self._st(f"⚙  {self.v_mat.get()} {self.v_thick.get()}mm [{prof}] → "
+                 f"Pul_On {r0['pul_on']}  I{r0['i_max']}  P_R {r0['p_ratio']}  "
+                 f"V{r0['voltage']}  ·  {v} mm/min  — valores iniciales, valida en máquina")
+
     # ── Presets de material ──────────────────────────
     def _preset_refresh(self):
         self._preset_cb['values']=sorted(load_presets().keys())
@@ -1732,7 +1819,7 @@ class App(tk.Tk):
                  'material':self.v_mat.get(),'thickness':self.v_thick.get(),
                  'wire':self.v_wire.get(),'flush':self.v_flush.get(),
                  'leadin':self.v_leadin.get(),'overcut':self.v_overcut.get(),
-                 'cutspeed':self.v_cutspeed.get(),
+                 'cutspeed':self.v_cutspeed.get(),'profile':self.v_profile.get(),
                  'H':[v.get() for v in self.h_vars],
                  'E':[[v.get() for v in fila] for fila in self.e_vars]}
         save_presets(d)
@@ -1748,6 +1835,7 @@ class App(tk.Tk):
         self.v_wire.set(pr.get('wire','0.18'));self.v_flush.set(pr.get('flush','DIC206'))
         self.v_leadin.set(pr.get('leadin','3.0'));self.v_overcut.set(pr.get('overcut','0.0'))
         self.v_cutspeed.set(pr.get('cutspeed','2.0'))
+        self.v_profile.set(pr.get('profile','Seguro'))
         for v,val in zip(self.h_vars,pr.get('H',[])): v.set(val)
         for fila,vals in zip(self.e_vars,pr.get('E',[])):
             for v,val in zip(fila,vals): v.set(val)
