@@ -56,7 +56,13 @@ def seg_dist(seg,wx,wy):
         tt=max(0.,min(1.,((wx-sx)*dx+(wy-sy)*dy)/l2))
         return pdist((wx,wy),(sx+tt*dx,sy+tt*dy))
     elif t=='ARC':
-        return abs(pdist((wx,wy),(seg['cx'],seg['cy']))-seg['r'])
+        # Distancia al ARCO visible, no al círculo completo — si el ángulo del
+        # punto cae fuera del arco, medir contra los extremos del arco.
+        cx,cy=seg['cx'],seg['cy']
+        a=norm_d(math.degrees(math.atan2(wy-cy,wx-cx)))
+        if _angle_on_arc(a,seg['sa'],seg['ea'],seg.get('ccw',True)):
+            return abs(pdist((wx,wy),(cx,cy))-seg['r'])
+        return min(pdist((wx,wy),seg['start']),pdist((wx,wy),seg['end']))
     return float('inf')
 
 # ═══════════════════════════════════════════════════
@@ -465,6 +471,7 @@ class DXFCanvas(tk.Canvas):
         self._hover_pt =None
         self._hover_idx=None
         self._info     ={}
+        self._measure  =None   # (p1,p2) de la última medición
         self._history  =[]    # pila de snapshots de all_segs (undo)
         self.custom_path=[]   # segmentos seleccionados manualmente en modo Path
         self.on_tool   =None  # callback(tool|mode) para resaltar botones
@@ -489,7 +496,7 @@ class DXFCanvas(tk.Canvas):
         self.thread_world=None;self.exit_world=None
         self.leadin_world=None;self.leadout_world=None
         self._tool='select';self._mode=None;self._draw_pts=[]
-        self._history=[];self._info={};self.custom_path=[]
+        self._history=[];self._info={};self.custom_path=[];self._measure=None
         if self.on_tool: self.on_tool('select')
         self.after(40,self._fit_active)
 
@@ -662,10 +669,25 @@ class DXFCanvas(tk.Canvas):
         if self.leadin_world:  self._dot(*self.leadin_world,'#a6e3a1','LEAD-IN','e')
         if self.leadout_world: self._dot(*self.leadout_world,'#f38ba8','LEAD-OUT','w')
 
+        # Medición persistente
+        if self._measure:
+            p1,p2=self._measure
+            c1=self.w2c(*p1);c2=self.w2c(*p2)
+            self.create_line(*c1,*c2,fill=CC['active'],width=1.5,dash=(4,3))
+            for px,py in (c1,c2):
+                self.create_line(px-4,py-4,px+4,py+4,fill=CC['active'],width=1.5)
+                self.create_line(px-4,py+4,px+4,py-4,fill=CC['active'],width=1.5)
+            dx=p2[0]-p1[0];dy=p2[1]-p1[1];d=math.hypot(dx,dy)
+            mx,my=(c1[0]+c2[0])/2,(c1[1]+c2[1])/2
+            txt=f'{d:.3f} mm'
+            tw=len(txt)*7/2+8
+            self.create_rectangle(mx-tw,my-24,mx+tw,my-8,fill='#e8f0fe',outline=CC['active'])
+            self.create_text(mx,my-16,text=txt,fill=CC['active'],font=('SF Mono',9,'bold'))
+
         self._draw_tool_preview()
 
         # Snap indicator
-        if self._hover_pt and self._tool in ('line','circle','arc'):
+        if self._hover_pt and self._tool in ('line','circle','arc','measure'):
             snapped=self._snap_is_ep(self._hover_pt)
             cx2,cy2=self.w2c(*self._hover_pt)
             col='#6200ea' if snapped else '#bdc1c6'
@@ -714,6 +736,15 @@ class DXFCanvas(tk.Canvas):
             self.create_line(*p1c,*p2c,fill=CC['user'],width=2,dash=(6,3))
             self._dot(*pts_w[0],CC['user'],'P1','e',sz=5)
 
+        elif tool=='measure' and len(pts_w)==1:
+            p1c=self.w2c(*pts_w[0]);p2c=self.w2c(*hp)
+            self.create_line(*p1c,*p2c,fill=CC['active'],width=1.5,dash=(4,3))
+            d=pdist(pts_w[0],hp)
+            mx,my=(p1c[0]+p2c[0])/2,(p1c[1]+p2c[1])/2
+            self.create_text(mx,my-10,text=f'{d:.3f} mm',
+                             fill=CC['active'],font=('SF Mono',9,'bold'))
+            self._dot(*pts_w[0],CC['active'],'P1','e',sz=5)
+
         elif tool=='circle' and len(pts_w)==1:
             cx2,cy2=pts_w[0];r=pdist((cx2,cy2),hp)
             if r>1e-6:
@@ -759,6 +790,8 @@ class DXFCanvas(tk.Canvas):
             if np>=2: return '🌙  Clic en el punto FINAL — ESC cancela'
             if np==1: return '🌙  Clic en el punto INICIAL'
             return '🌙  Clic en el centro'
+        if self._tool=='measure':
+            return '📐  Clic en el SEGUNDO punto — ESC sale' if np>=1 else '📐  Clic en el PRIMER punto a medir (snap a extremos)'
         if self._tool=='delete':
             return '🗑  Clic cerca de un segmento para borrarlo — ESC sale'
         if self._tool=='path':
@@ -839,6 +872,7 @@ class DXFCanvas(tk.Canvas):
 
     def set_tool(self,tool):
         self._tool=tool;self._mode=None;self._draw_pts=[]
+        if tool!='measure': self._measure=None
         self.config(cursor='crosshair' if tool!='select' else '')
         if self.on_tool: self.on_tool(tool)
         self._emit_status();self._draw()
@@ -850,7 +884,7 @@ class DXFCanvas(tk.Canvas):
         self._emit_status();self._draw()
 
     def _cancel(self):
-        self._tool='select';self._mode=None;self._draw_pts=[]
+        self._tool='select';self._mode=None;self._draw_pts=[];self._measure=None
         self.config(cursor='')
         if self.on_tool: self.on_tool('select')
         if self.status_cb: self.status_cb('🖱  Modo selección')
@@ -878,6 +912,7 @@ class DXFCanvas(tk.Canvas):
         if self._mode:          self._handle_mode(ev.x,ev.y); return
         if self._tool=='delete':self._do_delete(ev.x,ev.y); return
         if self._tool=='path':  self._do_path_click(ev.x,ev.y); return
+        if self._tool=='measure':self._do_measure(ev.x,ev.y); return
         if self._tool=='select':
             if len(self.contours)>1:
                 wx,wy=self.c2w(ev.x,ev.y);best_d=float('inf');best_i=0
@@ -908,13 +943,16 @@ class DXFCanvas(tk.Canvas):
             self.leadout_world=self._snap(cx,cy)
             if self.status_cb: self.status_cb(f'← Lead-out fijado en ({self.leadout_world[0]:.2f}, {self.leadout_world[1]:.2f}) mm')
         elif mode=='entry':
-            # Snap al endpoint más cercano del contorno
+            # Snap al endpoint más cercano del contorno. Si el punto clickeado
+            # es el FINAL de un segmento, la entrada real es el segmento
+            # SIGUIENTE (que empieza ahí) — así el corte arranca donde se hizo clic.
             chain=self.contours[self.active_idx] if self.contours else []
-            best_d=float('inf');best_i=0
+            n=len(chain);best_d=float('inf');best_i=0
             for i,seg in enumerate(chain):
-                for pt in [seg['start'],seg['end']]:
-                    d=pdist((wx,wy),pt)
-                    if d<best_d: best_d=d;best_i=i
+                d=pdist((wx,wy),seg['start'])
+                if d<best_d: best_d=d;best_i=i
+                d=pdist((wx,wy),seg['end'])
+                if d<best_d: best_d=d;best_i=(i+1)%n
             self.entry_seg=best_i
             ep=chain[best_i]['start'] if chain else (0,0)
             if self.status_cb: self.status_cb(f'▷ Entrada: segmento {best_i+1} — ({ep[0]:.2f},{ep[1]:.2f}) mm')
@@ -1000,6 +1038,22 @@ class DXFCanvas(tk.Canvas):
         self._rebuild()   # reconstruye contornos; la herramienta sigue activa
         if self.status_cb:
             self.status_cb(f'🗑  Segmento borrado ({len(self.all_segs)} restantes) — ESC sale')
+
+    # ── Medir — distancia entre dos puntos ──
+    def _do_measure(self,cx,cy):
+        wp=self._snap(cx,cy)
+        self._draw_pts.append(wp)
+        if len(self._draw_pts)==2:
+            p1,p2=self._draw_pts
+            self._measure=(p1,p2)
+            self._draw_pts=[]
+            dx=p2[0]-p1[0];dy=p2[1]-p1[1];d=math.hypot(dx,dy)
+            a=math.degrees(math.atan2(dy,dx))%360
+            if self.status_cb:
+                self.status_cb(f'📐  Dist {d:.3f} mm   ΔX {dx:+.3f}   ΔY {dy:+.3f}   ∠ {a:.1f}°')
+        else:
+            self._emit_status()
+        self._draw()
 
     # ── Path manual — seleccionar segmentos en orden ──
     @staticmethod
@@ -1328,6 +1382,8 @@ class App(tk.Tk):
         tbtn('/ Línea',    lambda:self.canvas.set_tool('line'),   fg='#1e7e34',abg='#e6f4ea',key='line')
         tbtn('○ Círculo',  lambda:self.canvas.set_tool('circle'), fg='#1e7e34',abg='#e6f4ea',key='circle')
         tbtn('( Arco',     lambda:self.canvas.set_tool('arc'),    fg='#1e7e34',abg='#e6f4ea',key='arc')
+        sep(row1)
+        tbtn('📐 Medir',   lambda:self.canvas.set_tool('measure'),fg=BLUE, abg=SEL,key='measure')
         sep(row1)
         tbtn('✕ Borrar',   lambda:self.canvas.set_tool('delete'), fg=RED,  abg='#fce8e6',key='delete')
         tbtn('↩ Undo',     lambda:self.canvas.undo(),             fg=ACCENT,abg=SEL)
