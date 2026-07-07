@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
 import math, os, sys, json
 
-__version__='1.3.0'
+__version__='1.4.0'
 
 try:
     import ezdxf
@@ -347,18 +347,22 @@ def overcut_pt(c,dm):
             rem-=al
     return c[0]['start']
 
-def truncate_chain(c,dist):
-    """Recorta la cadena a `dist` mm de recorrido — parte el segmento donde cae."""
-    out=[];rem=dist
+def split_chain(c,dist):
+    """Parte la cadena en `dist` mm de recorrido → (recorrido, resto).
+    El resto es la sección del puente (material virgen al final del corte)."""
+    a=[];b=[];rem=dist;done=False
     for seg in c:
+        if done: b.append(seg); continue
         if seg['type']=='LINE':
             sl=pdist(seg['start'],seg['end'])
             if rem<=sl-1e-9:
                 f=rem/sl if sl>1e-12 else 0.
                 sx,sy=seg['start'];ex,ey=seg['end']
-                s=dict(seg);s['end']=(sx+f*(ex-sx),sy+f*(ey-sy))
-                out.append(s);return out
-            out.append(seg);rem-=sl
+                pt=(sx+f*(ex-sx),sy+f*(ey-sy))
+                s1=dict(seg);s1['end']=pt;a.append(s1)
+                s2=dict(seg);s2['start']=pt;b.append(s2)
+                done=True
+            else: a.append(seg);rem-=sl
         elif seg['type']=='ARC':
             r=seg['r'];ccw=seg.get('ccw',True);sa,ea=seg['sa'],seg['ea']
             da=(ea-sa)%360 if ccw else (sa-ea)%360
@@ -367,10 +371,16 @@ def truncate_chain(c,dist):
             if rem<=al-1e-9:
                 frac=rem/al if al>1e-12 else 0.
                 na=norm_d(sa+da*frac) if ccw else norm_d(sa-da*frac)
-                s=dict(seg);s['ea']=na;s['end']=ang(seg['cx'],seg['cy'],r,na)
-                out.append(s);return out
-            out.append(seg);rem-=al
-    return out
+                pt=ang(seg['cx'],seg['cy'],r,na)
+                s1=dict(seg);s1['ea']=na;s1['end']=pt;a.append(s1)
+                s2=dict(seg);s2['sa']=na;s2['start']=pt;b.append(s2)
+                done=True
+            else: a.append(seg);rem-=al
+    return a,b
+
+def truncate_chain(c,dist):
+    """Recorta la cadena a `dist` mm de recorrido."""
+    return split_chain(c,dist)[0]
 
 def seg_to_g(seg):
     t=seg['type'];ex,ey=seg['end']
@@ -485,11 +495,11 @@ def generate_iso(chained,p):
     # Puente (tab): recortar el contorno para NO soltar la pieza.
     # Los repasos van en reversa por el mismo camino (ping-pong).
     tab=p.get('tab',0.);tab_on=tab>0.001
-    cut_chain=chained
+    cut_chain=chained;tab_chain=[]
     if tab_on:
         total=_clen(chained)
         if tab>=total-0.01: raise ValueError('Puente ≥ longitud del contorno.')
-        cut_chain=truncate_chain(chained,total-tab)
+        cut_chain,tab_chain=split_chain(chained,total-tab)
         do_oc=False   # overcut no aplica con puente
 
     thick=p['thickness']
@@ -513,21 +523,45 @@ def generate_iso(chained,p):
     if tab_on:
         stop_pt=cut_chain[-1]['end']
         comp_rev='G42' if comp=='G41' else 'G41'
+        exit_cmd='G00' if p.get('force_exit') else 'G01'
+        last_fwd=(cuts%2==1)   # ¿la pasada FINAL cae en sentido de ida?
         L+=["   ",f"; Number : 1",f"G92{xy(tx,ty)}","G90"]
-        for i in range(cuts):
-            sub='P0001' if i%2==0 else 'P0002'   # ida / regreso alternados
-            L+=[f"H{i+1:03d}",f"E{i+1:03d}",f"M98 {sub}","M00","   "]
+        if cuts==1:
+            # Una sola pasada: se detiene en el puente (acabado manual del puente)
+            L+=["H001","E001","M98 P0001","M00","   "]
+        else:
+            # Pasadas 1..N-1: ping-pong dejando el puente
+            for i in range(cuts-1):
+                sub='P0001' if i%2==0 else 'P0002'
+                L+=[f"H{i+1:03d}",f"E{i+1:03d}",f"M98 {sub}","M00","   "]
+            # Pasada N: corta TODO — cierra el puente y suelta la pieza al final
+            L+=[f"H{cuts:03d}",f"E{cuts:03d}","M98 P0003","M00","   "]
         L+=["M02","   "]
         # N0001 — IDA: corta hasta el puente y se detiene (la pieza NO cae)
         L+=[f"N0001",f"G01{xy(lx,ly)}",f"{comp}",f"G01{xy(sx,sy)}"]
         for seg in cut_chain: L.append(seg_to_g(seg))
         L+=["G50","G40","M99"]
         if cuts>1:
-            # N0002 — REGRESO: comp invertida (el lado se voltea con la dirección)
-            L+=["   ",f"N0002",f"{comp_rev}"]
-            for seg in rev(cut_chain): L.append(seg_to_g(seg))
-            L+=["G50","G40",f"G01{xy(lx,ly)}","M99"]
-        ex_lx,ex_ly=stop_pt
+            if cuts>2:
+                # N0002 — REGRESO: comp invertida (el lado se voltea con la dirección)
+                L+=["   ",f"N0002",f"{comp_rev}"]
+                for seg in rev(cut_chain): L.append(seg_to_g(seg))
+                L+=["G50","G40",f"G01{xy(lx,ly)}","M99"]
+            # N0003 — FINAL: contorno COMPLETO incluyendo el puente
+            if last_fwd:
+                # de ida: lead-in → contorno completo → cierra → lead-out
+                L+=["   ",f"N0003",f"G01{xy(lx,ly)}",f"{comp}",f"G01{xy(sx,sy)}"]
+                for seg in cut_chain+tab_chain: L.append(seg_to_g(seg))
+                L+=["G50","G40",f"{exit_cmd}{xy(ex_lx,ex_ly)}","M99"]
+            else:
+                # de regreso: repasa hacia atrás y corta el puente al final
+                L+=["   ",f"N0003",f"{comp_rev}"]
+                for seg in rev(cut_chain): L.append(seg_to_g(seg))
+                for seg in rev(tab_chain): L.append(seg_to_g(seg))
+                fx,fy=perp_pt(_flip(rev(tab_chain)[-1]),ll)
+                L+=["G50","G40",f"{exit_cmd}{xy(fx,fy)}","M99"]
+                ex_lx,ex_ly=fx,fy
+        if cuts==1: ex_lx,ex_ly=stop_pt
     else:
         L+=["   ",f"; Number : 1",f"G92{xy(tx,ty)}","G90","H001","E001","M98 P0001","M00","   "]
         for i in range(1,cuts):
@@ -604,21 +638,39 @@ def generate_iso_multi(contours,p):
         L+=["   ",f"; Number : {ci}",f"G92{xy(tx,ty)}","G90"]
 
         if tab_on and is_outer and tab<_clen(chained)-0.01:
-            cut_chain=truncate_chain(chained,_clen(chained)-tab)
+            cut_chain,tab_chain=split_chain(chained,_clen(chained)-tab)
             comp_rev='G42' if comp=='G41' else 'G41'
-            rev_n=len(conts)+1
-            for i in range(cuts):
-                sub_n=ci if i%2==0 else rev_n
-                L+=[f"H{i+1:03d}",f"E{i+1:03d}",f"M98 P{sub_n:04d}","M00","   "]
+            rev_n=len(conts)+1;fin_n=len(conts)+2
+            last_fwd=(cuts%2==1)
+            if cuts==1:
+                L+=["H001","E001",f"M98 P{ci:04d}","M00","   "]
+            else:
+                for i in range(cuts-1):
+                    sub_n=ci if i%2==0 else rev_n
+                    L+=[f"H{i+1:03d}",f"E{i+1:03d}",f"M98 P{sub_n:04d}","M00","   "]
+                L+=[f"H{cuts:03d}",f"E{cuts:03d}",f"M98 P{fin_n:04d}","M00","   "]
             sub=[f"N{ci:04d}",f"G01{xy(lx,ly)}",comp,f"G01{xy(sx,sy)}"]
             for seg in cut_chain: sub.append(seg_to_g(seg))
             sub+=["G50","G40","M99"]
             subs.append(sub)
             if cuts>1:
-                sub2=[f"N{rev_n:04d}",comp_rev]
-                for seg in rev(cut_chain): sub2.append(seg_to_g(seg))
-                sub2+=["G50","G40",f"G01{xy(lx,ly)}","M99"]
-                subs.append(sub2)
+                if cuts>2:
+                    sub2=[f"N{rev_n:04d}",comp_rev]
+                    for seg in rev(cut_chain): sub2.append(seg_to_g(seg))
+                    sub2+=["G50","G40",f"G01{xy(lx,ly)}","M99"]
+                    subs.append(sub2)
+                # Pasada final: contorno completo, suelta la pieza al terminar
+                if last_fwd:
+                    sub3=[f"N{fin_n:04d}",f"G01{xy(lx,ly)}",comp,f"G01{xy(sx,sy)}"]
+                    for seg in cut_chain+tab_chain: sub3.append(seg_to_g(seg))
+                    sub3+=["G50","G40",f"{exit_cmd}{xy(ex_lx,ex_ly)}","M99"]
+                else:
+                    sub3=[f"N{fin_n:04d}",comp_rev]
+                    for seg in rev(cut_chain): sub3.append(seg_to_g(seg))
+                    for seg in rev(tab_chain): sub3.append(seg_to_g(seg))
+                    fx,fy=perp_pt(_flip(rev(tab_chain)[-1]),ll)
+                    sub3+=["G50","G40",f"{exit_cmd}{xy(fx,fy)}","M99"]
+                subs.append(sub3)
             continue
 
         for i in range(cuts):
@@ -2052,28 +2104,39 @@ class App(tk.Tk):
         sx,sy = info['sx'],info['sy']
         ex_lx,ex_ly = info['ex_lx'],info['ex_ly']
 
-        # Con puente: recortar el contorno y simular el regreso en reversa
+        # Con puente: recortar el contorno y simular TODAS las pasadas
         tab=p.get('tab',0.)
-        sim_chain=chain
+        sim_chain=chain;tab_sec=[]
         if tab>0.001:
             total=_clen(chain)
-            if tab<total-0.01: sim_chain=truncate_chain(chain,total-tab)
+            if tab<total-0.01: sim_chain,tab_sec=split_chain(chain,total-tab)
         last_end = sim_chain[-1]['end']
+
+        def seg_pts(segs):
+            out=[]
+            for seg in segs:
+                if seg['type']=='LINE':
+                    x0,y0=seg['start']; x1,y1=seg['end']
+                    out+=lp(x0,y0,x1,y1)
+                elif seg['type']=='ARC':
+                    out+=ap(seg['cx'],seg['cy'],seg['r'],seg['sa'],seg['ea'],seg['ccw'])
+            return out
 
         pts=[]
         pts += lp(tx,ty,lx,ly)         # hilo → lead-in approach
         pts += lp(lx,ly,sx,sy)         # lead-in → entrada contorno
-        cpts=[]
-        for seg in sim_chain:
-            if seg['type']=='LINE':
-                x0,y0=seg['start']; x1,y1=seg['end']
-                cpts+=lp(x0,y0,x1,y1)
-            elif seg['type']=='ARC':
-                cpts+=ap(seg['cx'],seg['cy'],seg['r'],seg['sa'],seg['ea'],seg['ccw'])
+        cpts=seg_pts(sim_chain)
         pts+=cpts
-        if tab>0.001:
-            if p['cuts']>1: pts+=cpts[::-1]   # repaso de REGRESO por el mismo camino
-        else:
+        if tab>0.001 and tab_sec:
+            tpts=seg_pts(tab_sec)
+            n=p['cuts']
+            for k in range(1,n):
+                last=(k==n-1)
+                if k%2==1:   # pasada de REGRESO
+                    pts+=cpts[::-1]+(tpts[::-1] if last else [])
+                else:        # pasada de IDA
+                    pts+=cpts+(tpts if last else [])
+        elif tab<=0.001:
             pts += lp(last_end[0],last_end[1],ex_lx,ex_ly)  # fin contorno → lead-out
 
         # ── Controles inline en la barra de estado ──
