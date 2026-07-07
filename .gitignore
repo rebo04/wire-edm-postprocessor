@@ -1,0 +1,23 @@
+# Output files (don't commit generated ISO/G-code)
+*.ISO
+*.iso
+*.nc
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.spec
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Local agent/tool scratch dirs
+.claude/
