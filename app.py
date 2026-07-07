@@ -2,7 +2,9 @@
 """Wire EDM Post-Processor  —  SKD2 / EAPT   by Arturo Rebolledo"""
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
-import math, os, sys
+import math, os, sys, json
+
+__version__='1.1.0'
 
 try:
     import ezdxf
@@ -355,6 +357,47 @@ def seg_to_g(seg):
     return ''
 
 # ═══════════════════════════════════════════════════
+#  KERF (trayectoria compensada) Y CHEQUEO DE GOUGE
+# ═══════════════════════════════════════════════════
+def kerf_seg_pts(seg,comp,d):
+    """Puntos del camino REAL del hilo (compensado G41/G42 por d mm)."""
+    if d<=1e-9: return []
+    left=(comp=='G41')
+    if seg['type']=='LINE':
+        tx,ty=seg_tangent(seg)
+        nx,ny=(-ty,tx) if left else (ty,-tx)
+        (x0,y0),(x1,y1)=seg['start'],seg['end']
+        return [(x0+nx*d,y0+ny*d),(x1+nx*d,y1+ny*d)]
+    elif seg['type']=='ARC':
+        ccw=seg.get('ccw',True)
+        toward_center=(ccw and left) or ((not ccw) and (not left))
+        r2=seg['r']-d if toward_center else seg['r']+d
+        if r2<=1e-9: return []
+        cx,cy=seg['cx'],seg['cy'];sa,ea=seg['sa'],seg['ea']
+        span=(ea-sa)%360 if ccw else -((sa-ea)%360)
+        if abs(span)<1e-6: span=360. if ccw else -360.
+        n=max(8,int(abs(span)/4))
+        return [ang(cx,cy,r2,sa+span*t/n) for t in range(n+1)]
+    return []
+
+def gouge_check(chained,comp,d):
+    """Arcos con radio interno ≤ offset → la máquina alarmea o gougea.
+    Retorna lista de (x,y,mensaje) en el punto medio del arco problemático."""
+    warns=[];left=(comp=='G41')
+    for i,seg in enumerate(chained):
+        if seg['type']!='ARC': continue
+        ccw=seg.get('ccw',True)
+        toward_center=(ccw and left) or ((not ccw) and (not left))
+        if toward_center and seg['r']<=d+1e-9:
+            sa,ea=seg['sa'],seg['ea']
+            span=(ea-sa)%360 if ccw else (sa-ea)%360
+            if span<1e-6: span=360.
+            mid=norm_d(sa+span/2) if ccw else norm_d(sa-span/2)
+            mx,my=ang(seg['cx'],seg['cy'],seg['r'],mid)
+            warns.append((mx,my,f'Seg {i+1}: R{seg["r"]:.3f}mm ≤ offset {d:.3f}mm'))
+    return warns
+
+# ═══════════════════════════════════════════════════
 #  GENERADOR ISO
 # ═══════════════════════════════════════════════════
 def generate_iso(chained,p):
@@ -417,8 +460,15 @@ def generate_iso(chained,p):
     thick=p['thickness']
     ts=str(int(thick)) if thick==int(thick) else str(thick)
 
+    # Tiempo estimado: pasada 1 a velocidad de corte, repasos ~3× más rápidos
+    v_cut=p.get('cut_speed',0.)
+    plen=_clen(chained)+ll*2+p['overcut']
+    est=sum(plen/(v_cut*(1. if i==0 else 3.)) for i in range(cuts)) if v_cut>1e-9 else 0.
+
     L=[]
     L.append(f"(MATERIAL:{p['material']} THICKNESS:{ts} mm WIRE:{p['wire']}mm FLUSH:{p['flush']} MODE:{mode} CUTNUM:{cuts})")
+    if est>0:
+        L.append(f"(EST TIME: {int(est//60)}h {int(est%60):02d}m  PATH:{plen:.1f}mm  @{v_cut}mm/min)")
     L.append("(     W_Sp   I_Max   Pul_On    P_Ratio   Voltage   Auxiliary  Speed)")
     for i,ep in enumerate(eparams,1):
         L.append(f"E{i:03d}=   {ep['w_sp']:03d}    {ep['i_max']:03d}    {ep['pul_on']:03d}    "
@@ -435,10 +485,76 @@ def generate_iso(chained,p):
     exit_cmd='G00' if p.get('force_exit') else 'G01'
     L+=["G50","G40",f"{exit_cmd}{xy(ex_lx,ex_ly)}","M99"]
 
+    d0=offsets[0]/1000.
     return '\r\n'.join(L),{
         'direction':direction,'comp':comp,
         'lx':lx,'ly':ly,'tx':tx,'ty':ty,'sx':sx,'sy':sy,
-        'ex_lx':ex_lx,'ex_ly':ex_ly}
+        'ex_lx':ex_lx,'ex_ly':ex_ly,
+        'kerf':[kerf_seg_pts(s,comp,d0) for s in chained],
+        'gouges':gouge_check(chained,comp,d0),
+        'offset_mm':d0,'est_min':est}
+
+# ═══════════════════════════════════════════════════
+#  GENERADOR ISO MULTI-CONTORNO
+# ═══════════════════════════════════════════════════
+def generate_iso_multi(contours,p):
+    """Un solo programa que corta TODOS los contornos de la placa.
+    Interiores (más cortos) primero, perfil exterior al final — la pieza
+    queda sujeta hasta el último corte. M00 entre contornos para re-enhebrar."""
+    conts=[list(c) for c in contours if c]
+    if not conts: raise ValueError('Sin contornos.')
+    conts=sorted(conts,key=_clen)   # interiores primero, exterior al final
+    mode=p['mode'];cuts=p['cuts']
+    comp=p['comp']
+    if comp=='auto': comp='G41' if mode=='Core' else 'G42'
+    offsets=list(p['offsets']);eparams=list(p['eparams'])
+    while len(offsets)<cuts: offsets.append(offsets[-1])
+    while len(eparams)<cuts: eparams.append(eparams[-1])
+    offsets=offsets[:cuts];eparams=eparams[:cuts]
+    ll=p['leadin_length'];do_oc=p['overcut']>0.001
+    exit_cmd='G00' if p.get('force_exit') else 'G01'
+    thick=p['thickness']
+    ts=str(int(thick)) if thick==int(thick) else str(thick)
+
+    v_cut=p.get('cut_speed',0.)
+    tlen=sum(_clen(c)+ll*2+p['overcut'] for c in conts)
+    est=sum(tlen/(v_cut*(1. if i==0 else 3.)) for i in range(cuts)) if v_cut>1e-9 else 0.
+
+    L=[]
+    L.append(f"(MATERIAL:{p['material']} THICKNESS:{ts} mm WIRE:{p['wire']}mm FLUSH:{p['flush']} MODE:{mode} CUTNUM:{cuts} CONTOURS:{len(conts)})")
+    if est>0:
+        L.append(f"(EST TIME: {int(est//60)}h {int(est%60):02d}m  PATH:{tlen:.1f}mm  @{v_cut}mm/min)")
+    L.append("(     W_Sp   I_Max   Pul_On    P_Ratio   Voltage   Auxiliary  Speed)")
+    for i,ep in enumerate(eparams,1):
+        L.append(f"E{i:03d}=   {ep['w_sp']:03d}    {ep['i_max']:03d}    {ep['pul_on']:03d}    "
+                 f"{ep['p_ratio']:03d}    {ep['voltage']:03d}    {ep['aux']:03d}    {ep['speed']:03d}")
+    if cuts==1: L.append(f"H001={offsets[0]} ")
+    else:       L.append("  ".join(f"H{i+1:03d}={o}" for i,o in enumerate(offsets)))
+
+    subs=[]
+    for ci,chained in enumerate(conts,1):
+        direction=contour_dir(chained)
+        if mode=='Cavity' and direction=='CCW': chained=rev(chained)
+        elif mode=='Core'  and direction=='CW':  chained=rev(chained)
+        sx,sy=chained[0]['start']
+        lx,ly=perp_pt(chained[0],ll)   # lead-in perpendicular automático
+        tx,ty=lx,ly                    # agujero de enhebrado = punto de lead-in
+        ex_lx,ex_ly=perp_pt(chained[-1],ll)
+        oc=overcut_pt(chained,p['overcut'])
+
+        L+=["   ",f"; Number : {ci}",f"G92{xy(tx,ty)}","G90"]
+        for i in range(cuts):
+            L+=[f"H{i+1:03d}",f"E{i+1:03d}",f"M98 P{ci:04d}","M00","   "]
+
+        sub=[f"N{ci:04d}",f"G01{xy(lx,ly)}",comp,f"G01{xy(sx,sy)}"]
+        for seg in chained: sub.append(seg_to_g(seg))
+        if do_oc: sub.append(f"G01{xy(*oc)}")
+        sub+=["G50","G40",f"{exit_cmd}{xy(ex_lx,ex_ly)}","M99"]
+        subs.append(sub)
+
+    L+=["   ","M02","   "]
+    for sub in subs: L+=sub+["   "]
+    return '\r\n'.join(L)
 
 # ═══════════════════════════════════════════════════
 #  CANVAS
@@ -472,6 +588,7 @@ class DXFCanvas(tk.Canvas):
         self._hover_idx=None
         self._info     ={}
         self._measure  =None   # (p1,p2) de la última medición
+        self.show_kerf =True   # dibujar trayectoria compensada real
         self._history  =[]    # pila de snapshots de all_segs (undo)
         self.custom_path=[]   # segmentos seleccionados manualmente en modo Path
         self.on_tool   =None  # callback(tool|mode) para resaltar botones
@@ -662,6 +779,21 @@ class DXFCanvas(tk.Canvas):
             ex_lx,ex_ly=info.get('ex_lx',lx),info.get('ex_ly',ly)
             if (ex_lx,ex_ly)!=(lx,ly):
                 self._dot(ex_lx,ex_ly,CC['exit'],'SALIDA','w')
+
+        # Kerf: trayectoria REAL del hilo compensada por el offset H1
+        if info and self.show_kerf and info.get('kerf'):
+            for kp in info['kerf']:
+                if len(kp)<2: continue
+                pts=[]
+                for x,y in kp: pts+=list(self.w2c(x,y))
+                self.create_line(pts,fill='#f9ab00',width=1.5,dash=(2,3))
+        # Radios menores al offset → marcar riesgo de gouge
+        if info:
+            for gx,gy,_msg in info.get('gouges',[]):
+                cx2,cy2=self.w2c(gx,gy)
+                self.create_oval(cx2-9,cy2-9,cx2+9,cy2+9,outline='#d93025',width=2)
+                self.create_text(cx2,cy2-16,text='⚠',fill='#d93025',
+                                 font=('SF Pro Display',12,'bold'))
 
         if self.thread_world: self._dot(*self.thread_world,CC['thread'],'HILO','e')
         elif info and 'tx' in info: self._dot(info['tx'],info['ty'],CC['thread'],'HILO','e')
@@ -1149,10 +1281,21 @@ E_SKIM=[
 ]
 H_DEF=[100,75,60,50]
 
+# ── Presets de material (persisten en el home del usuario) ──
+PRESET_FILE=os.path.expanduser('~/.wedm_presets.json')
+def load_presets():
+    try:
+        with open(PRESET_FILE,encoding='utf-8') as f: return json.load(f)
+    except Exception: return {}
+def save_presets(d):
+    try:
+        with open(PRESET_FILE,'w',encoding='utf-8') as f: json.dump(d,f,indent=1,ensure_ascii=False)
+    except Exception: pass
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('Wire EDM Post-Processor  —  SKD2 / EAPT')
+        self.title(f'Wire EDM Post-Processor  —  SKD2 / EAPT  v{__version__}')
         self.configure(bg=DARK);self.geometry('1350x820');self.minsize(960,640)
         self._code='';self._units='mm'
         self.v_dxf=tk.StringVar();self.v_layer=tk.StringVar()
@@ -1161,6 +1304,8 @@ class App(tk.Tk):
         self.v_mat=tk.StringVar(value='SKD11');self.v_thick=tk.StringVar(value='10')
         self.v_wire=tk.StringVar(value='0.18');self.v_flush=tk.StringVar(value='DIC206')
         self.v_leadin=tk.StringVar(value='3.0');self.v_overcut=tk.StringVar(value='0.0')
+        self.v_cutspeed=tk.StringVar(value='2.0')   # mm/min primera pasada (estimación)
+        self.v_kerf=tk.BooleanVar(value=True)       # mostrar trayectoria compensada
         self.v_leadin_angle =tk.StringVar(value='')   # ángulo lead-in  (vacío = auto/perp)
         self.v_leadout_angle=tk.StringVar(value='')   # ángulo lead-out (vacío = auto/perp)
         self.v_same_lead=tk.BooleanVar(value=False)
@@ -1185,7 +1330,7 @@ class App(tk.Tk):
         self.lbl_units=tk.Label(hdr,text='',bg=ACCENT,fg='#aec8f8',
                                 font=('SF Pro Display',9),padx=12)
         self.lbl_units.pack(side='right')
-        tk.Label(hdr,text='by Arturo Rebolledo',bg=ACCENT,fg='#aec8f8',
+        tk.Label(hdr,text=f'v{__version__}  ·  by Arturo Rebolledo',bg=ACCENT,fg='#aec8f8',
                  font=('SF Pro Display',9),padx=8).pack(side='right')
 
         # ── Body ────────────────────────────────────────────
@@ -1218,6 +1363,7 @@ class App(tk.Tk):
                       activebackground=bg,activeforeground=fg
                       ).pack(side='right',padx=(0,8),pady=6)
         abtn('💾  Guardar .ISO', self._save,    ACCENT)
+        abtn('⧉  TODO',          self._gen_all, '#6200ea')
         abtn('▶  Generar',       self._gen,     '#1e7e34')
         abtn('▶  Simular',       self._simulate,'#c62828')
 
@@ -1276,12 +1422,37 @@ class App(tk.Tk):
         row('Cutin',  self.v_cutin, choices=['perp','line','point'])
         row('Comp',   self.v_comp,  choices=['auto','G41','G42'])
         row('Pasadas',self.v_cuts,  choices=[1,2,3,4],w=5)
+        rfk=tk.Frame(f,bg=SIDEBAR);rfk.pack(fill='x',padx=10,pady=(2,2))
+        tk.Checkbutton(rfk,text='Ver kerf (trayectoria real)',
+                       variable=self.v_kerf,bg=SIDEBAR,fg='#b45309',
+                       selectcolor=ENTRY,activebackground=SIDEBAR,activeforeground='#b45309',
+                       font=('SF Pro Display',9),command=self._toggle_kerf
+                       ).pack(anchor='w')
 
         sec('🔩  MATERIAL')
         row('Material',  self.v_mat)
         row('Espesor mm',self.v_thick,w=7)
         row('Hilo Ø mm', self.v_wire, w=7)
         row('Flush',     self.v_flush)
+        row('Vel mm/min',self.v_cutspeed,w=7)
+        tk.Label(f,text='Vel. de corte 1ª pasada — para estimar tiempo',
+                 bg=SIDEBAR,fg=TEXT2,font=('SF Pro Display',7)).pack(anchor='w',padx=14)
+
+        sec('💾  PRESETS')
+        self.v_preset=tk.StringVar()
+        prf=tk.Frame(f,bg=SIDEBAR);prf.pack(fill='x',padx=10,pady=2)
+        self._preset_cb=ttk.Combobox(prf,textvariable=self.v_preset,values=[],
+                                     width=24,state='readonly')
+        self._preset_cb.pack(fill='x')
+        self._preset_cb.bind('<<ComboboxSelected>>',self._preset_load)
+        prb=tk.Frame(f,bg=SIDEBAR);prb.pack(fill='x',padx=10,pady=(3,2))
+        tk.Button(prb,text='💾 Guardar preset',command=self._preset_save,
+                  bg=ACCENT,fg='white',relief='flat',font=('SF Pro Display',9,'bold'),
+                  padx=6,pady=3,cursor='hand2').pack(side='left',fill='x',expand=True)
+        tk.Button(prb,text='🗑',command=self._preset_delete,
+                  bg='#fce8e6',fg=RED,relief='flat',font=('SF Pro Display',9,'bold'),
+                  padx=8,pady=3,cursor='hand2').pack(side='left',padx=(4,0))
+        self._preset_refresh()
 
         sec('📐  LEAD-IN / OUT')
         row('Lead-in mm', self.v_leadin,  w=7)
@@ -1430,7 +1601,8 @@ class App(tk.Tk):
         leg=tk.Frame(parent,bg=PANEL);leg.pack(fill='x',padx=8,pady=3)
         tk.Frame(parent,bg=BORDER,height=1).pack(fill='x')
         for col,txt in [(RED,'Hilo'),(YELLOW,'Entrada'),('#c45000','Salida'),
-                        (GREEN,'Lead-in'),(BLUE,'Activo'),('#bdc1c6','Ref')]:
+                        (GREEN,'Lead-in'),(BLUE,'Activo'),('#f9ab00','Kerf'),
+                        ('#bdc1c6','Ref')]:
             tk.Frame(leg,bg=col,width=9,height=9).pack(side='left',padx=(4,1))
             tk.Label(leg,text=txt,bg=PANEL,fg=TEXT2,font=('SF Pro Display',8)).pack(side='left',padx=(0,6))
         tk.Label(leg,text='Scroll=zoom  ·  Arrastrar=pan  ·  Ctrl+Z=deshacer',
@@ -1502,6 +1674,7 @@ class App(tk.Tk):
             'leadin_angle' :f(self.v_leadin_angle,  None) if self.v_leadin_angle.get().strip()  else None,
             'leadout_angle':f(self.v_leadout_angle, None) if self.v_leadout_angle.get().strip() else None,
             'leadin_length':f(self.v_leadin,3.),'overcut':f(self.v_overcut,0.),
+            'cut_speed':f(self.v_cutspeed,2.),
             'material':self.v_mat.get() or 'SKD11','thickness':f(self.v_thick,10.),
             'wire':f(self.v_wire,.18),'flush':self.v_flush.get() or 'DIC206',
             'offsets':offsets,'eparams':eparams}
@@ -1513,10 +1686,80 @@ class App(tk.Tk):
             p=self._params();code,info=generate_iso(chain,p)
             self._code=code;self._show_code(code);self.canvas.update_info(info)
             nc=len(self.canvas.contours);ac=self.canvas.active_idx
-            self._st(f"✓  Contorno {ac+1}/{nc}  |  {info['direction']}  |  {info['comp']}  |  "
-                     f"{p['cuts']} pasada(s)  |  Entry({info['sx']:.1f},{info['sy']:.1f})mm")
+            tstr=self._fmt_min(info.get('est_min',0))
+            gouges=info.get('gouges',[])
+            if gouges:
+                self._st(f"⚠  {len(gouges)} radio(s) ≤ offset — RIESGO DE GOUGE/ALARMA: "
+                         f"{gouges[0][2]}"+('  (+más)' if len(gouges)>1 else ''),True)
+            else:
+                self._st(f"✓  Contorno {ac+1}/{nc}  |  {info['direction']}  |  {info['comp']}  |  "
+                         f"{p['cuts']} pasada(s)  |  ⏱ {tstr}  |  Entry({info['sx']:.1f},{info['sy']:.1f})mm")
         except Exception as e:
             self._st(f'Error: {e}',True);import traceback;traceback.print_exc()
+
+    @staticmethod
+    def _fmt_min(m):
+        if m<=0: return '—'
+        h=int(m//60);mm=int(round(m%60))
+        return f'{h}h {mm:02d}m' if h else f'{mm}m'
+
+    def _toggle_kerf(self):
+        self.canvas.show_kerf=self.v_kerf.get()
+        self.canvas._draw()
+
+    def _gen_all(self):
+        """Genera UN programa con todos los contornos de la placa."""
+        if not self.canvas.contours:
+            self._st('⚠  Carga un DXF primero',True); return
+        try:
+            p=self._params()
+            code=generate_iso_multi(self.canvas.contours,p)
+            self._code=code;self._show_code(code)
+            self._st(f'✓  Programa múltiple: {len(self.canvas.contours)} contornos '
+                     f'(interiores primero) — 💾 Guardar .ISO para exportar')
+        except Exception as e:
+            self._st(f'Error: {e}',True);import traceback;traceback.print_exc()
+
+    # ── Presets de material ──────────────────────────
+    def _preset_refresh(self):
+        self._preset_cb['values']=sorted(load_presets().keys())
+
+    def _preset_save(self):
+        t=self.v_thick.get().strip() or '?'
+        name=f"{self.v_mat.get().strip() or 'MAT'} {t}mm ø{self.v_wire.get().strip()}"
+        d=load_presets()
+        d[name]={'mode':self.v_mode.get(),'cuts':int(self.v_cuts.get() or 1),
+                 'material':self.v_mat.get(),'thickness':self.v_thick.get(),
+                 'wire':self.v_wire.get(),'flush':self.v_flush.get(),
+                 'leadin':self.v_leadin.get(),'overcut':self.v_overcut.get(),
+                 'cutspeed':self.v_cutspeed.get(),
+                 'H':[v.get() for v in self.h_vars],
+                 'E':[[v.get() for v in fila] for fila in self.e_vars]}
+        save_presets(d)
+        self._preset_refresh();self.v_preset.set(name)
+        self._st(f'💾  Preset guardado: {name}')
+
+    def _preset_load(self,*_):
+        d=load_presets();name=self.v_preset.get()
+        if name not in d: return
+        pr=d[name]
+        self.v_mode.set(pr.get('mode','Core'));self.v_cuts.set(pr.get('cuts',1))
+        self.v_mat.set(pr.get('material',''));self.v_thick.set(pr.get('thickness','10'))
+        self.v_wire.set(pr.get('wire','0.18'));self.v_flush.set(pr.get('flush','DIC206'))
+        self.v_leadin.set(pr.get('leadin','3.0'));self.v_overcut.set(pr.get('overcut','0.0'))
+        self.v_cutspeed.set(pr.get('cutspeed','2.0'))
+        for v,val in zip(self.h_vars,pr.get('H',[])): v.set(val)
+        for fila,vals in zip(self.e_vars,pr.get('E',[])):
+            for v,val in zip(fila,vals): v.set(val)
+        self._refresh_h();self._gen()
+        self._st(f'✓  Preset cargado: {name}')
+
+    def _preset_delete(self):
+        d=load_presets();name=self.v_preset.get()
+        if name not in d: return
+        del d[name];save_presets(d)
+        self._preset_refresh();self.v_preset.set('')
+        self._st(f'🗑  Preset borrado: {name}')
 
     def _apply_leadin_angle(self):
         chain=self.canvas.active_chain()

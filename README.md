@@ -2,7 +2,19 @@
 
 **Created by Arturo Rebolledo**
 
-Reads a DXF profile, lets you set thread hole, lead-in/lead-out, entry/exit points interactively on a canvas, and generates ISO/G-code compatible with SKD2/SKDA wire EDM controllers. Includes contour detection, offset passes with per-pass E-parameters, path simulation, and manual drawing/editing tools (line, circle, arc, delete, custom path).
+Reads a DXF profile, lets you set thread hole, lead-in/lead-out, entry/exit points interactively on a canvas, and generates ISO/G-code compatible with SKD2/SKDA wire EDM controllers. Includes contour detection, offset passes with per-pass E-parameters, path simulation, and manual drawing/editing tools (line, circle, arc, delete, custom path, measure).
+
+### Key features
+
+- **Kerf preview + gouge check** — draws the *real* compensated wire path (G41/G42 × offset H1) as an amber dashed line, and flags in red any inside radius smaller than the offset — the exact geometry that makes the controller alarm or gouge the part.
+- **Material presets** — save proven E-params/offsets/passes per material + thickness (`💾 PRESETS` in the sidebar) and reload them in one click. Stored in `~/.wedm_presets.json`.
+- **Multi-contour program (⧉ TODO)** — generates ONE ISO that cuts every contour in the plate: interior openings first, outer profile last, with `M00` re-thread stops between contours.
+- **Cut time estimate** — shows estimated machine time in the status bar and as a comment in the ISO header, based on the editable `Vel mm/min` cutting speed (skim passes assumed ~3× faster).
+- **📐 Medir tool** — click two points (snaps to endpoints) to measure distance, ΔX/ΔY and angle on the canvas.
+
+### Rolling back
+
+Every version stays available on the [Releases](../../releases) page — if a new version misbehaves, just download the previous one.
 
 ---
 
