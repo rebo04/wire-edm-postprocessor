@@ -13,6 +13,7 @@ Reads a DXF profile, lets you set thread hole, lead-in/lead-out, entry/exit poin
 - **Multi-contour program (⧉ TODO)** — generates ONE ISO that cuts every contour in the plate: interior openings first, outer profile last, with `M00` re-thread stops between contours.
 - **Cut time estimate** — shows estimated machine time in the status bar and as a comment in the ISO header, based on the editable `Vel mm/min` cutting speed (skim passes assumed ~3× faster).
 - **📐 Medir tool** — click two points (snaps to endpoints) to measure distance, ΔX/ΔY and angle on the canvas.
+- **Exact-dimension drawing** — activating Línea/Círculo/Arco/Rect shows a dimension bar above the canvas: type exact coordinates, **Longitud + Ángulo** (lines chain automatically P1←P2 so you can trace a whole profile typing dims), **R or Ø** for circles, center/radius/angles/direction for arcs, and X,Y + Ancho×Alto for the new **▭ Rect** tool. Clicking the canvas fills the fields; Enter adds the entity. Live length/angle/size labels while drawing, and snapping now includes line midpoints and arc centers.
 
 ### Rolling back
 

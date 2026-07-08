@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
 import math, os, sys, json
 
-__version__='1.4.0'
+__version__='1.5.0'
 
 try:
     import ezdxf
@@ -714,6 +714,7 @@ class DXFCanvas(tk.Canvas):
         self._tool     ='select'
         self._mode     =None
         self._draw_pts =[]
+        self.on_draw_pts=None  # callback(tool,pts) para llenar la barra de dims
         self._hover_pt =None
         self._hover_idx=None
         self._info     ={}
@@ -784,7 +785,13 @@ class DXFCanvas(tk.Canvas):
         wx,wy=self.c2w(cx,cy);sr=SNAP_PX/self._view['scale']
         best_d=sr;best=(wx,wy)
         for seg in self.all_segs:
-            for pt in [seg['start'],seg['end']]:
+            cand=[seg['start'],seg['end']]
+            if seg['type']=='LINE':
+                cand.append(((seg['start'][0]+seg['end'][0])/2,
+                             (seg['start'][1]+seg['end'][1])/2))   # punto medio
+            elif seg['type']=='ARC':
+                cand.append((seg['cx'],seg['cy']))                 # centro
+            for pt in cand:
                 d=pdist((wx,wy),pt)
                 if d<best_d: best_d=d;best=pt
         return best
@@ -951,7 +958,7 @@ class DXFCanvas(tk.Canvas):
         self._draw_tool_preview()
 
         # Snap indicator
-        if self._hover_pt and self._tool in ('line','circle','arc','measure'):
+        if self._hover_pt and self._tool in ('line','circle','arc','rect','measure'):
             snapped=self._snap_is_ep(self._hover_pt)
             cx2,cy2=self.w2c(*self._hover_pt)
             col='#6200ea' if snapped else '#bdc1c6'
@@ -998,6 +1005,20 @@ class DXFCanvas(tk.Canvas):
         if tool=='line' and len(pts_w)==1:
             p1c=self.w2c(*pts_w[0]);p2c=self.w2c(*hp)
             self.create_line(*p1c,*p2c,fill=CC['user'],width=2,dash=(6,3))
+            d=pdist(pts_w[0],hp)
+            a=math.degrees(math.atan2(hp[1]-pts_w[0][1],hp[0]-pts_w[0][0]))%360
+            mx,my=(p1c[0]+p2c[0])/2,(p1c[1]+p2c[1])/2
+            self.create_text(mx,my-12,text=f'{d:.2f}mm  ∠{a:.1f}°',
+                             fill=CC['user'],font=('SF Mono',9,'bold'))
+            self._dot(*pts_w[0],CC['user'],'P1','e',sz=5)
+
+        elif tool=='rect' and len(pts_w)==1:
+            p1c=self.w2c(*pts_w[0]);p2c=self.w2c(*hp)
+            self.create_rectangle(*p1c,*p2c,outline=CC['user'],width=2,dash=(6,3))
+            w=abs(hp[0]-pts_w[0][0]);h=abs(hp[1]-pts_w[0][1])
+            mx,my=(p1c[0]+p2c[0])/2,(p1c[1]+p2c[1])/2
+            self.create_text(mx,my,text=f'{w:.2f} × {h:.2f}',
+                             fill=CC['user'],font=('SF Mono',9,'bold'))
             self._dot(*pts_w[0],CC['user'],'P1','e',sz=5)
 
         elif tool=='measure' and len(pts_w)==1:
@@ -1014,6 +1035,9 @@ class DXFCanvas(tk.Canvas):
             if r>1e-6:
                 p1c=self.w2c(cx2-r,cy2-r);p2c=self.w2c(cx2+r,cy2+r)
                 self.create_oval(*p1c,*p2c,outline=CC['user'],width=2,dash=(6,3))
+                pc=self.w2c(cx2,cy2)
+                self.create_text(pc[0],pc[1]-14,text=f'R {r:.2f}  Ø {2*r:.2f}',
+                                 fill=CC['user'],font=('SF Mono',9,'bold'))
             self._dot(*pts_w[0],CC['user'],'CENTRO','e',sz=5)
 
         elif tool=='arc':
@@ -1047,13 +1071,15 @@ class DXFCanvas(tk.Canvas):
         if self._mode=='leadin':  return '➡  Clic en el punto de LEAD-IN (donde llega el hilo antes de entrar al corte)'
         if self._mode=='leadout': return '⬅  Clic en el punto de LEAD-OUT (donde sale el hilo después del corte)'
         if self._tool=='line':
-            return '📏  Clic para segundo punto — ESC cancela' if np>=1 else '📏  Clic para primer punto'
+            return '📏  Clic para segundo punto, o escribe X2,Y2 / Long+Áng abajo — ESC cancela' if np>=1 else '📏  Clic para primer punto (o escribe X1,Y1 en la barra)'
         if self._tool=='circle':
-            return '⭕  Clic en el borde — ESC cancela' if np>=1 else '⭕  Clic en el centro'
+            return '⭕  Clic en el borde, o escribe R / Ø abajo — ESC cancela' if np>=1 else '⭕  Clic en el centro (o escribe Centro X,Y en la barra)'
         if self._tool=='arc':
-            if np>=2: return '🌙  Clic en el punto FINAL — ESC cancela'
-            if np==1: return '🌙  Clic en el punto INICIAL'
-            return '🌙  Clic en el centro'
+            if np>=2: return '🌙  Clic en el punto FINAL, o escribe Áng fin abajo — ESC cancela'
+            if np==1: return '🌙  Clic en el punto INICIAL (o escribe R y ángulos abajo)'
+            return '🌙  Clic en el centro (o escribe Centro X,Y en la barra)'
+        if self._tool=='rect':
+            return '▭  Clic en la esquina opuesta, o escribe Ancho×Alto abajo — ESC cancela' if np>=1 else '▭  Clic en la primera esquina (o escribe X,Y en la barra)'
         if self._tool=='measure':
             return '📐  Clic en el SEGUNDO punto — ESC sale' if np>=1 else '📐  Clic en el PRIMER punto a medir (snap a extremos)'
         if self._tool=='delete':
@@ -1189,7 +1215,7 @@ class DXFCanvas(tk.Canvas):
                     self._fit_active()
                     if self.on_changed: self.on_changed();return
             self._drag0=(ev.x,ev.y);self._view0=(self._view['ox'],self._view['oy'])
-        elif self._tool in ('line','circle','arc'):
+        elif self._tool in ('line','circle','arc','rect'):
             self._do_draw(ev.x,ev.y)
 
     def _handle_mode(self,cx,cy):
@@ -1236,8 +1262,16 @@ class DXFCanvas(tk.Canvas):
         self._draw()
 
     # ── Línea / Círculo / Arco (quedan activos) ────
+    def add_segments(self,segs):
+        """Agrega segmentos desde la barra de dimensiones (con undo)."""
+        if not segs: return
+        self._snapshot()
+        self.all_segs+=segs
+        self._rebuild()
+
     def _do_draw(self,cx,cy):
         wp=self._snap(cx,cy);self._draw_pts.append(wp)
+        if self.on_draw_pts: self.on_draw_pts(self._tool,list(self._draw_pts))
         tool=self._tool;pts=self._draw_pts;committed=False
 
         if tool=='line' and len(pts)==2:
@@ -1270,6 +1304,18 @@ class DXFCanvas(tk.Canvas):
                 self._snapshot()
                 self.all_segs.append({'type':'ARC','cx':cx2,'cy':cy2,'r':r,
                     'sa':sa,'ea':ea,'ccw':True,'start':(sx2,sy2),'end':(ex2,ey2)})
+                committed=True
+            self._draw_pts=[]
+
+        elif tool=='rect' and len(pts)==2:
+            (x1,y1),(x2,y2)=pts
+            if abs(x2-x1)>0.01 and abs(y2-y1)>0.01:
+                self._snapshot()
+                self.all_segs+=[
+                    {'type':'LINE','start':(x1,y1),'end':(x2,y1)},
+                    {'type':'LINE','start':(x2,y1),'end':(x2,y2)},
+                    {'type':'LINE','start':(x2,y2),'end':(x1,y2)},
+                    {'type':'LINE','start':(x1,y2),'end':(x1,y1)}]
                 committed=True
             self._draw_pts=[]
 
@@ -1497,6 +1543,8 @@ class App(tk.Tk):
         self.v_leadin=tk.StringVar(value='3.0');self.v_overcut=tk.StringVar(value='0.0')
         self.v_cutspeed=tk.StringVar(value='2.0')   # mm/min primera pasada (estimación)
         self.v_tab=tk.StringVar(value='0')          # puente mm (0 = corte completo)
+        self.d_vars={}                              # campos de la barra de dimensiones
+        self.d_sent=tk.StringVar(value='CCW')       # sentido del arco por dims
         self.v_kerf=tk.BooleanVar(value=True)       # mostrar trayectoria compensada
         self.v_leadin_angle =tk.StringVar(value='')   # ángulo lead-in  (vacío = auto/perp)
         self.v_leadout_angle=tk.StringVar(value='')   # ángulo lead-out (vacío = auto/perp)
@@ -1760,6 +1808,7 @@ class App(tk.Tk):
         tbtn('/ Línea',    lambda:self.canvas.set_tool('line'),   fg='#1e7e34',abg='#e6f4ea',key='line')
         tbtn('○ Círculo',  lambda:self.canvas.set_tool('circle'), fg='#1e7e34',abg='#e6f4ea',key='circle')
         tbtn('( Arco',     lambda:self.canvas.set_tool('arc'),    fg='#1e7e34',abg='#e6f4ea',key='arc')
+        tbtn('▭ Rect',     lambda:self.canvas.set_tool('rect'),   fg='#1e7e34',abg='#e6f4ea',key='rect')
         sep(row1)
         tbtn('📐 Medir',   lambda:self.canvas.set_tool('measure'),fg=BLUE, abg=SEL,key='measure')
         sep(row1)
@@ -1788,9 +1837,13 @@ class App(tk.Tk):
                  ).pack(side='left',pady=5)
         tbtn('↻ Aplicar',self._rotate,fg='#6200ea',abg='#ede7f6',r=row2)
 
+        # Barra de dimensiones (aparece al activar una herramienta de dibujo)
+        self.draw_bar=tk.Frame(parent,bg='#fff8e1')
+
         self.canvas=DXFCanvas(parent,on_changed=self._gen,status_cb=self._st)
         self.canvas.on_tool=self._highlight_tool
         self.canvas._open_cb=self._open
+        self.canvas.on_draw_pts=self._draw_pts_changed
         self.canvas.pack(fill='both',expand=True)
         self.bind_all('<Control-z>',lambda e:self.canvas.undo())
         self.bind_all('<Control-Z>',lambda e:self.canvas.undo())
@@ -1821,6 +1874,138 @@ class App(tk.Tk):
                 btn.config(bg=ACCENT,fg='white',relief='flat',font=('SF Pro Display',9,'bold'))
             else:
                 btn.config(bg=bg,fg=fg,relief='flat',font=('SF Pro Display',9))
+        self._show_draw_bar(active_key)
+
+    # ── Barra de dimensiones exactas ─────────────────
+    def _show_draw_bar(self,tool):
+        for w in self.draw_bar.winfo_children(): w.destroy()
+        if tool not in ('line','circle','arc','rect'):
+            self.draw_bar.pack_forget();return
+        DB='#fff8e1';FG='#7a5c00'
+        def fld(lbl,name,w=7):
+            tk.Label(self.draw_bar,text=lbl,bg=DB,fg=FG,
+                     font=('SF Pro Display',9)).pack(side='left',padx=(8,2))
+            v=self.d_vars.setdefault(name,tk.StringVar())
+            e=tk.Entry(self.draw_bar,textvariable=v,width=w,bg='white',fg=TEXT,
+                       insertbackground=TEXT,relief='solid',bd=1,font=('SF Mono',9))
+            e.pack(side='left',pady=4)
+            e.bind('<Return>',lambda ev:self._draw_bar_add(tool))
+            return e
+        def osep(t='o'):
+            tk.Label(self.draw_bar,text=t,bg=DB,fg='#b0a068',
+                     font=('SF Pro Display',9,'italic')).pack(side='left',padx=6)
+
+        if tool=='line':
+            fld('X1','x1');fld('Y1','y1');osep('→')
+            fld('X2','x2');fld('Y2','y2');osep()
+            fld('Long','len');fld('Áng°','ang')
+            hint='clic fija P1 · Enter agrega · se encadena (P1←P2) para trazar el perfil'
+        elif tool=='circle':
+            fld('Centro X','cx');fld('Y','cy');osep('·')
+            fld('R','r');osep();fld('Ø','dia')
+            hint='clic fija el centro · escribe R o Ø · Enter agrega'
+        elif tool=='arc':
+            fld('Centro X','cx');fld('Y','cy');fld('R','r')
+            fld('Áng ini°','a1');fld('Áng fin°','a2')
+            tk.Label(self.draw_bar,text='Sentido',bg=DB,fg=FG,
+                     font=('SF Pro Display',9)).pack(side='left',padx=(8,2))
+            ttk.Combobox(self.draw_bar,textvariable=self.d_sent,values=['CCW','CW'],
+                         width=5,state='readonly').pack(side='left')
+            hint='clic fija centro (y radio con 2º clic) · Enter agrega'
+        else:  # rect
+            fld('X','rx');fld('Y','ry');osep('·')
+            fld('Ancho','rw');fld('Alto','rh')
+            hint='clic fija la esquina · Ancho/Alto negativos van a la izq/abajo'
+
+        tk.Button(self.draw_bar,text='✚ Agregar',command=lambda:self._draw_bar_add(tool),
+                  bg='#1e7e34',fg='white',relief='flat',font=('SF Pro Display',9,'bold'),
+                  padx=12,pady=3,cursor='hand2').pack(side='left',padx=10)
+        tk.Button(self.draw_bar,text='⌫',command=self._draw_bar_clear,
+                  bg=DB,fg='#b45309',relief='flat',font=('SF Pro Display',10),
+                  padx=6,cursor='hand2').pack(side='left')
+        tk.Label(self.draw_bar,text='💡 '+hint,bg=DB,fg='#b0a068',
+                 font=('SF Pro Display',8)).pack(side='right',padx=8)
+        self.draw_bar.pack(fill='x',before=self.canvas)
+
+    def _draw_bar_clear(self):
+        for v in self.d_vars.values(): v.set('')
+        self.canvas._draw_pts=[];self.canvas._draw()
+
+    def _dbf(self,name):
+        v=self.d_vars.get(name)
+        if not v: return None
+        s=v.get().strip().replace(',','.')
+        if not s: return None
+        try: return float(s)
+        except: return None
+
+    def _draw_pts_changed(self,tool,pts):
+        """Clic en el lienzo → refleja el punto en la barra de dimensiones."""
+        if not pts: return
+        sv=lambda n,val: self.d_vars.setdefault(n,tk.StringVar()).set(f'{val:.3f}')
+        p=pts[0]
+        if tool=='line':   sv('x1',p[0]);sv('y1',p[1])
+        elif tool=='circle': sv('cx',p[0]);sv('cy',p[1])
+        elif tool=='rect':   sv('rx',p[0]);sv('ry',p[1])
+        elif tool=='arc':
+            sv('cx',p[0]);sv('cy',p[1])
+            if len(pts)>=2:
+                sv('r',pdist(pts[0],pts[1]))
+                sv('a1',math.degrees(math.atan2(pts[1][1]-p[1],pts[1][0]-p[0]))%360)
+
+    def _draw_bar_add(self,tool):
+        gf=self._dbf;cv=self.canvas
+        if tool=='line':
+            x1=gf('x1');y1=gf('y1');x2=gf('x2');y2=gf('y2');ln=gf('len');an=gf('ang')
+            if x1 is None or y1 is None:
+                self._st('⚠  Falta P1 — haz clic en el lienzo o escribe X1,Y1',True);return
+            if x2 is None or y2 is None:
+                if ln is None or an is None:
+                    self._st('⚠  Escribe X2,Y2  o  Longitud + Ángulo',True);return
+                a=math.radians(an);x2=x1+ln*math.cos(a);y2=y1+ln*math.sin(a)
+            if pdist((x1,y1),(x2,y2))<0.01:
+                self._st('⚠  Longitud cero',True);return
+            cv.add_segments([{'type':'LINE','start':(x1,y1),'end':(x2,y2)}])
+            # Encadenar: el final es el nuevo P1 — perfil por dims consecutivas
+            self.d_vars['x1'].set(f'{x2:.3f}');self.d_vars['y1'].set(f'{y2:.3f}')
+            for n in ('x2','y2','len','ang'):
+                if n in self.d_vars: self.d_vars[n].set('')
+            cv._draw_pts=[(x2,y2)]
+            self._st(f'✓  Línea agregada — P1 ahora en ({x2:.2f}, {y2:.2f}): sigue con Long/Áng, X2,Y2 o clic')
+        elif tool=='circle':
+            cx=gf('cx');cy=gf('cy');r=gf('r');dia=gf('dia')
+            if r is None and dia is not None: r=dia/2.
+            if cx is None or cy is None or r is None or r<=0:
+                self._st('⚠  Escribe Centro X, Y y Radio (o Ø)',True);return
+            cv.add_segments([
+                {'type':'ARC','cx':cx,'cy':cy,'r':r,'sa':0.,'ea':180.,'ccw':True,
+                 'start':ang(cx,cy,r,0.),'end':ang(cx,cy,r,180.)},
+                {'type':'ARC','cx':cx,'cy':cy,'r':r,'sa':180.,'ea':0.,'ccw':True,
+                 'start':ang(cx,cy,r,180.),'end':ang(cx,cy,r,0.)}])
+            cv._draw_pts=[]
+            self._st(f'✓  Círculo R{r:g} en ({cx:g}, {cy:g})')
+        elif tool=='arc':
+            cx=gf('cx');cy=gf('cy');r=gf('r');a1=gf('a1');a2=gf('a2')
+            if None in (cx,cy,r,a1,a2) or r<=0:
+                self._st('⚠  Escribe Centro X, Y, Radio y ambos ángulos',True);return
+            ccw=self.d_sent.get()!='CW'
+            cv.add_segments([{'type':'ARC','cx':cx,'cy':cy,'r':r,
+                'sa':norm_d(a1),'ea':norm_d(a2),'ccw':ccw,
+                'start':ang(cx,cy,r,a1),'end':ang(cx,cy,r,a2)}])
+            cv._draw_pts=[]
+            self._st(f'✓  Arco R{r:g}  {a1:g}°→{a2:g}° ({self.d_sent.get()})')
+        elif tool=='rect':
+            x=gf('rx');y=gf('ry');w=gf('rw');h=gf('rh')
+            if None in (x,y,w,h) or abs(w)<0.01 or abs(h)<0.01:
+                self._st('⚠  Escribe X, Y, Ancho y Alto (≠0)',True);return
+            x2,y2=x+w,y+h
+            cv.add_segments([
+                {'type':'LINE','start':(x,y),'end':(x2,y)},
+                {'type':'LINE','start':(x2,y),'end':(x2,y2)},
+                {'type':'LINE','start':(x2,y2),'end':(x,y2)},
+                {'type':'LINE','start':(x,y2),'end':(x,y)}])
+            cv._draw_pts=[]
+            self._st(f'✓  Rectángulo {abs(w):g} × {abs(h):g} en ({x:g}, {y:g})')
 
     def _build_code(self,parent):
         hdr=tk.Frame(parent,bg=PANEL);hdr.pack(fill='x',padx=8,pady=(8,2))
